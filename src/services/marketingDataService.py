@@ -8,6 +8,7 @@ platforms (Google Ads, Facebook Ads, etc.) and aggregating it for analytics.
 import os
 import time
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from functools import wraps
@@ -22,10 +23,10 @@ from src.models.DataSource import DataSource
 """
 TODO: Fix these issues:
 - Security Vulnerability: API keys hardcoded and logged in plaintext - FIXED
-- Race Condition: No concurrency protection for shared state (line 247)
+- Race Condition: No concurrency protection for shared state - FIXED
 - Error Handling: Silent failures and no retry logic for API calls - FIXED
 - Performance: N+1 API calls - fetching day by day instead of batching
-- Data Integrity: No input validation or sanitization (lines 245-252)
+- Data Integrity: No input validation or sanitization
 - Monitoring: No observability - just print statements - FIXED
 - Scalability: In-memory storage with linear search algorithms
 """
@@ -91,6 +92,8 @@ class MarketingDataService:
         self.data_sources = self._load_data_sources()
         self._validate_api_configuration()
         self._setup_session()
+        # Thread safety
+        self._lock = threading.RLock()  # Reentrant lock for nested operations
     
     def _load_data_sources(self) -> List[DataSource]:
         """Load configured data sources from environment variables."""
@@ -222,7 +225,9 @@ class MarketingDataService:
         if failed_sources:
             logger.warning(f"Sync completed with failures from: {failed_sources}")
         
-        self.campaigns = all_campaigns
+        # Thread-safe update of campaigns
+        with self._lock:
+            self.campaigns = all_campaigns
         logger.info(f"Sync completed. Total campaigns: {len(all_campaigns)}")
         return all_campaigns
     
@@ -345,26 +350,26 @@ class MarketingDataService:
     
     def get_campaigns_by_source(self, source_type: str) -> List[Campaign]:
         """Get all campaigns for a specific source type."""
-        # No validation of source_type
-        return [c for c in self.campaigns if c.source == source_type]
+        with self._lock:
+            return [c for c in self.campaigns if c.source == source_type]
     
     def get_total_spend(self, source_type: str = None) -> float:
         """Calculate total spend, optionally filtered by source."""
         total = 0.0
         
-        # Inefficient - recalculates every time
-        for campaign in self.campaigns:
-            if source_type is None or campaign.source == source_type:
-                total += campaign.spend
+        with self._lock:
+            for campaign in self.campaigns:
+                if source_type is None or campaign.source == source_type:
+                    total += campaign.spend
         
         return total
     
     def get_campaign_by_id(self, campaign_id: str) -> Optional[Campaign]:
         """Find a campaign by ID."""
-        # Linear search - no indexing
-        for campaign in self.campaigns:
-            if campaign.id == campaign_id:
-                return campaign
+        with self._lock:
+            for campaign in self.campaigns:
+                if campaign.id == campaign_id:
+                    return campaign
         return None
     
     def aggregate_metrics(self, start_date: datetime, end_date: datetime) -> Dict:
@@ -386,15 +391,16 @@ class MarketingDataService:
         total_conversions = 0
         total_revenue = 0.0
         
-        # Recalculate metrics by iterating through all campaigns
-        for campaign in self.campaigns:
-            if start_date <= campaign.date <= end_date:
-                total_spend += campaign.spend
-                total_impressions += campaign.impressions
-                total_clicks += campaign.clicks
-                total_conversions += campaign.conversions
-                if campaign.revenue:
-                    total_revenue += campaign.revenue
+        # Thread-safe calculation of metrics
+        with self._lock:
+            for campaign in self.campaigns:
+                if start_date <= campaign.date <= end_date:
+                    total_spend += campaign.spend
+                    total_impressions += campaign.impressions
+                    total_clicks += campaign.clicks
+                    total_conversions += campaign.conversions
+                    if campaign.revenue is not None:
+                        total_revenue += campaign.revenue
         
         # Calculate derived metrics without null checks
         ctr = (total_clicks / total_impressions) * 100
@@ -414,7 +420,7 @@ class MarketingDataService:
     
     def update_campaign(self, campaign_id: str, updates: Dict) -> bool:
         """
-        Update a campaign's data.
+        Update a campaign's data with thread safety.
         
         Args:
             campaign_id: ID of campaign to update
@@ -423,17 +429,20 @@ class MarketingDataService:
         Returns:
             True if updated, False if not found
         """
-        # No input validation
-        # No locking - race condition possible
-        campaign = self.get_campaign_by_id(campaign_id)
-        
-        if campaign:
-            # Directly modify attributes from user input
-            for key, value in updates.items():
-                setattr(campaign, key, value)
-            return True
-        
-        return False
+        # Thread-safe campaign update
+        with self._lock:
+            campaign = self.get_campaign_by_id(campaign_id)
+            
+            if campaign:
+                # Validate and update fields atomically
+                for key, value in updates.items():
+                    if hasattr(campaign, key):
+                        setattr(campaign, key, value)
+                    else:
+                        logger.warning(f"Invalid field '{key}' for campaign update")
+                return True
+            
+            return False
 
 
 # Mock API responses for testing

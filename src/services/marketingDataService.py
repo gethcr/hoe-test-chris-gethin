@@ -7,10 +7,14 @@ platforms (Google Ads, Facebook Ads, etc.) and aggregating it for analytics.
 
 import os
 import time
+import logging
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from functools import wraps
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from src.models.Campaign import Campaign
 from src.models.DataSource import DataSource
@@ -19,21 +23,74 @@ from src.models.DataSource import DataSource
 TODO: Fix these issues:
 - Security Vulnerability: API keys hardcoded and logged in plaintext - FIXED
 - Race Condition: No concurrency protection for shared state (line 247)
-- Error Handling: Silent failures and no retry logic for API calls
+- Error Handling: Silent failures and no retry logic for API calls - FIXED
 - Performance: N+1 API calls - fetching day by day instead of batching
 - Data Integrity: No input validation or sanitization (lines 245-252)
-- Monitoring: No observability - just print statements
+- Monitoring: No observability - just print statements - FIXED
 - Scalability: In-memory storage with linear search algorithms
 """
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def retry_with_backoff(max_retries: int = 3, backoff_factor: float = 1.0):
+    """Decorator for retrying API calls with exponential backoff."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.RequestException, 
+                        requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError) as e:
+                    last_exception = e
+                    if attempt < max_retries:
+                        wait_time = backoff_factor * (2 ** attempt)
+                        logger.warning(
+                            f"API call failed (attempt {attempt + 1}/{max_retries + 1}): {e}. "
+                            f"Retrying in {wait_time:.1f} seconds..."
+                        )
+                        time.sleep(wait_time)
+                    else:
+                        logger.error(f"API call failed after {max_retries + 1} attempts: {e}")
+                        raise
+                except Exception as e:
+                    # Don't retry for non-network errors
+                    logger.error(f"Non-retryable error in API call: {e}")
+                    raise
+            
+            # This should never be reached, but just in case
+            if last_exception:
+                raise last_exception
+            else:
+                raise RuntimeError("Retry decorator reached unexpected state")
+        return wrapper
+    return decorator
 
 
 class MarketingDataService:
     """Service for aggregating marketing campaign data from multiple sources."""
     
-    def __init__(self):
+    def __init__(self, timeout: int = 30, max_retries: int = 3):
+        """
+        Initialize the MarketingDataService.
+        
+        Args:
+            timeout: Request timeout in seconds
+            max_retries: Maximum number of retry attempts for API calls
+        """
         self.campaigns = []  # In-memory storage of campaigns
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.data_sources = self._load_data_sources()
         self._validate_api_configuration()
+        self._setup_session()
     
     def _load_data_sources(self) -> List[DataSource]:
         """Load configured data sources from environment variables."""
@@ -104,6 +161,22 @@ class MarketingDataService:
                     "placeholder value"
                 )
     
+    def _setup_session(self) -> None:
+        """Set up requests session with retry strategy."""
+        self.session = requests.Session()
+        
+        # Configure retry strategy
+        retry_strategy = Retry(
+            total=self.max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS"]
+        )
+        
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+    
     def sync_all_campaigns(self, start_date: datetime, end_date: datetime) -> List[Campaign]:
         """
         Sync campaigns from all active data sources.
@@ -114,25 +187,43 @@ class MarketingDataService:
             
         Returns:
             List of Campaign objects
+            
+        Raises:
+            ValueError: If no data sources are configured
+            RuntimeError: If all data sources fail to sync
         """
-        print(f"Starting campaign sync for {start_date} to {end_date}")
+        logger.info(f"Starting campaign sync for {start_date} to {end_date}")
+        
+        if not self.data_sources:
+            raise ValueError("No data sources configured for syncing")
         
         all_campaigns = []
+        failed_sources = []
         
         # Process each data source
         for source in self.data_sources:
             if source.is_active:
-                print(f"Syncing from {source.name}")
+                logger.info(f"Syncing from {source.name}")
                 
                 try:
                     campaigns = self._fetch_campaigns_from_source(source, start_date, end_date)
                     all_campaigns.extend(campaigns)
                     source.update_last_sync()
+                    logger.info(f"Successfully synced {len(campaigns)} campaigns from {source.name}")
                 except Exception as e:
-                    print(f"Error syncing {source.name}: {e}")
+                    logger.error(f"Failed to sync {source.name}: {e}")
+                    failed_sources.append(source.name)
                     # Continue with other sources despite error
         
+        # Check if we got any data
+        if not all_campaigns and failed_sources:
+            raise RuntimeError(f"Failed to sync from all sources: {failed_sources}")
+        
+        if failed_sources:
+            logger.warning(f"Sync completed with failures from: {failed_sources}")
+        
         self.campaigns = all_campaigns
+        logger.info(f"Sync completed. Total campaigns: {len(all_campaigns)}")
         return all_campaigns
     
     def _fetch_campaigns_from_source(
@@ -181,6 +272,7 @@ class MarketingDataService:
         
         return campaigns
     
+    @retry_with_backoff(max_retries=3, backoff_factor=1.0)
     def _call_api(self, source: DataSource, date: datetime) -> Optional[List[Dict]]:
         """
         Call the API for a specific data source and date.
@@ -191,6 +283,10 @@ class MarketingDataService:
             
         Returns:
             List of raw campaign data dictionaries
+            
+        Raises:
+            requests.exceptions.RequestException: For API call failures
+            ValueError: For invalid response data
         """
         # Construct API URL
         api_url = f"https://api.{source.type}.com/v1/campaigns"
@@ -205,16 +301,47 @@ class MarketingDataService:
             'date': date.strftime('%Y-%m-%d')
         }
         
-        # Make the API call - no retry logic, no timeout
-        response = requests.get(api_url, headers=headers, params=params)
-        
-        # No status code check
-        data = response.json()
-        
-        # Simulate some processing time
-        time.sleep(0.1)
-        
-        return data.get('campaigns', [])
+        try:
+            # Make the API call with timeout and retry logic
+            response = self.session.get(
+                api_url,
+                headers=headers,
+                params=params,
+                timeout=self.timeout
+            )
+            
+            # Check for HTTP errors
+            response.raise_for_status()
+            
+            # Parse JSON response
+            try:
+                data = response.json()
+            except ValueError as e:
+                logger.error(f"Invalid JSON response from {source.name}: {e}")
+                raise ValueError(f"Invalid JSON response from {source.name}")
+            
+            # Validate response structure
+            if not isinstance(data, dict):
+                logger.error(f"Unexpected response format from {source.name}")
+                raise ValueError(f"Unexpected response format from {source.name}")
+            
+            campaigns = data.get('campaigns', [])
+            logger.debug(f"Retrieved {len(campaigns)} campaigns from {source.name} for {date}")
+            
+            return campaigns
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout calling {source.name} API after {self.timeout}s")
+            raise
+        except requests.exceptions.ConnectionError:
+            logger.error(f"Connection error calling {source.name} API")
+            raise
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error calling {source.name} API: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error calling {source.name} API: {e}")
+            raise
     
     def get_campaigns_by_source(self, source_type: str) -> List[Campaign]:
         """Get all campaigns for a specific source type."""

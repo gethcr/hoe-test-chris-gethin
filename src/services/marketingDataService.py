@@ -5,12 +5,26 @@ This service is responsible for fetching campaign data from various marketing
 platforms (Google Ads, Facebook Ads, etc.) and aggregating it for analytics.
 """
 
-import requests
+import os
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+
+import requests
+
 from src.models.Campaign import Campaign
 from src.models.DataSource import DataSource
+
+"""
+TODO: Fix these issues:
+- Security Vulnerability: API keys hardcoded and logged in plaintext - FIXED
+- Race Condition: No concurrency protection for shared state (line 247)
+- Error Handling: Silent failures and no retry logic for API calls
+- Performance: N+1 API calls - fetching day by day instead of batching
+- Data Integrity: No input validation or sanitization (lines 245-252)
+- Monitoring: No observability - just print statements
+- Scalability: In-memory storage with linear search algorithms
+"""
 
 
 class MarketingDataService:
@@ -19,36 +33,76 @@ class MarketingDataService:
     def __init__(self):
         self.campaigns = []  # In-memory storage of campaigns
         self.data_sources = self._load_data_sources()
+        self._validate_api_configuration()
     
     def _load_data_sources(self) -> List[DataSource]:
-        """Load configured data sources from storage."""
-        # Mock data sources - in reality this would be from a database
-        return [
-            DataSource(
+        """Load configured data sources from environment variables."""
+        # Load API keys from environment variables for security
+        google_ads_key = os.getenv('GOOGLE_ADS_API_KEY')
+        facebook_ads_key = os.getenv('FACEBOOK_ADS_API_KEY')
+        tiktok_ads_key = os.getenv('TIKTOK_ADS_API_KEY')
+        
+        data_sources = []
+        
+        # Only create data sources if API keys are available
+        if google_ads_key:
+            data_sources.append(DataSource(
                 id="ds_1",
                 name="Google Ads Account",
                 type="google_ads",
-                api_key="gads_secret_key_12345",
-                account_id="123-456-7890",
+                api_key=google_ads_key,
+                account_id=os.getenv('GOOGLE_ADS_ACCOUNT_ID', '123-456-7890'),
                 is_active=True
-            ),
-            DataSource(
+            ))
+        
+        if facebook_ads_key:
+            data_sources.append(DataSource(
                 id="ds_2",
                 name="Facebook Ads Account",
                 type="facebook_ads",
-                api_key="fb_secret_key_67890",
-                account_id="act_9876543210",
+                api_key=facebook_ads_key,
+                account_id=os.getenv('FACEBOOK_ADS_ACCOUNT_ID', 'act_9876543210'),
                 is_active=True
-            ),
-            DataSource(
+            ))
+        
+        if tiktok_ads_key:
+            data_sources.append(DataSource(
                 id="ds_3",
                 name="TikTok Ads Account",
                 type="tiktok_ads",
-                api_key="tt_secret_key_11111",
-                account_id="tt_987654321",
+                api_key=tiktok_ads_key,
+                account_id=os.getenv('TIKTOK_ADS_ACCOUNT_ID', 'tt_987654321'),
                 is_active=False  # Inactive source
+            ))
+        
+        return data_sources
+    
+    def _validate_api_configuration(self) -> None:
+        """Validate that API keys are properly configured."""
+        if not self.data_sources:
+            raise ValueError(
+                "No data sources configured. Please set the required "
+                "environment variables: GOOGLE_ADS_API_KEY, "
+                "FACEBOOK_ADS_API_KEY, TIKTOK_ADS_API_KEY"
             )
-        ]
+
+        # Check for empty or invalid API keys
+        for source in self.data_sources:
+            if not source.api_key or len(source.api_key.strip()) == 0:
+                raise ValueError(
+                    f"Invalid API key configuration for {source.name}"
+                )
+
+            # Basic validation - API keys should not contain common placeholder values
+            invalid_patterns = [
+                'your_api_key', 'api_key_here', 'secret_key', 'placeholder'
+            ]
+            if any(pattern in source.api_key.lower()
+                   for pattern in invalid_patterns):
+                raise ValueError(
+                    f"API key for {source.name} appears to be a "
+                    "placeholder value"
+                )
     
     def sync_all_campaigns(self, start_date: datetime, end_date: datetime) -> List[Campaign]:
         """
@@ -68,7 +122,7 @@ class MarketingDataService:
         # Process each data source
         for source in self.data_sources:
             if source.is_active:
-                print(f"Syncing from {source.name} with API key: {source.api_key}")
+                print(f"Syncing from {source.name}")
                 
                 try:
                     campaigns = self._fetch_campaigns_from_source(source, start_date, end_date)
